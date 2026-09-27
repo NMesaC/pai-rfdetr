@@ -420,6 +420,22 @@ class RFDETRModelModule(LightningModule):
         if model_config.backbone_lora:
             apply_lora(self.model)
 
+        # PerforatedAI wraps the target modules after the pretrained weights load and before the EMA, optimizer, and
+        # checkpoint callbacks bind to the model.
+        if train_config.perforate:
+            if model_config.compile:
+                raise ValueError(
+                    "perforate=True does not support compile=True: torch.compile over PAI modules is untested."
+                )
+            if self._use_manual_optimization:
+                raise ValueError(
+                    "perforate=True does not support the keypoint manual-optimization path; use a detection model."
+                )
+            # Optional-dependency boundary: rfdetr.training.perforated imports perforatedai lazily.
+            from rfdetr.training.perforated import perforate_detection_model
+
+            self.model = perforate_detection_model(self.model, model_config, train_config)  # type: ignore[assignment]
+
         # Build criterion/postprocessors after potential num_classes alignment so
         # they are constructed with a config that matches the current model head.
         self.criterion, self.postprocess = build_criterion_from_config(self.model_config, self.train_config)
@@ -1418,6 +1434,12 @@ class RFDETRModelModule(LightningModule):
             PTL optimizer config dict with optimizer and step-interval scheduler.
         """
         tc = self.train_config
+        if tc.perforate:
+            # PAI builds AdamW and its own ReduceLROnPlateau and rebuilds both after every restructure; Lightning is
+            # handed no scheduler so a validation is never counted twice.
+            from rfdetr.training.perforated import setup_perforated_optimizer
+
+            return cast(OptimizerLRSchedulerConfig, {"optimizer": setup_perforated_optimizer(self)})
         ns = _namespace_from_configs(self.model_config, tc)
 
         # Unwrap torch.compile's OptimizedModule so get_param_dict sees the

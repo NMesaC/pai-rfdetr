@@ -102,6 +102,27 @@ _TC_NON_NAMESPACE_FIELDS = {
     "optimizer_param_group_overrides",
     # Dataset class labels.
     "class_names",
+    # PerforatedAI settings are consumed by rfdetr.training.perforated, never by the legacy args namespace.
+    "perforate",
+    "pai_target",
+    "pai_n_epochs_to_switch",
+    "pai_p_epochs_to_switch",
+    "pai_initial_correlation_batches",
+    "pai_initial_correlation_fraction",
+    "pai_max_dendrites",
+    "pai_max_dendrite_tries",
+    "pai_fixed_switch_every",
+    "pai_testing_dendrite_capacity",
+    "pai_track_leaves",
+    "pai_save_name",
+    "pai_load_folder",
+    "pai_load_stage",
+    "pai_force_first_switch",
+    "pai_dendrite_lr",
+    "pai_candidate_init_mult",
+    "pai_candidate_init_by_main",
+    "pai_global_candidates",
+    "pai_forward_function",
 }
 
 # Derived: all TrainConfig fields not in _TC_NON_NAMESPACE_FIELDS.

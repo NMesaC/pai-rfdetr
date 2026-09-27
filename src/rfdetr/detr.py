@@ -1220,7 +1220,15 @@ class RFDETR:
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
         # Sync the trained weights back so predict() / export() see the updated model.
-        self.model.model = module.model
+        if config.perforate:
+            # The trained module carries PAI's dendrite scaffolding, which predict/export cannot run. Sync the clean
+            # copy (EMA weights, already loaded by RFDETREMACallback.on_train_end) instead; the live module and its
+            # checkpoints are untouched.
+            from rfdetr.training.perforated import clean_perforated_model
+
+            self.model.model = clean_perforated_model(module.model)  # type: ignore[assignment]
+        else:
+            self.model.model = module.model
         # Rebuild model.args from the real training config (#1199): it was previously left as the
         # construction-time snapshot built from a dummy TrainConfig, so overrides like lr/lr_encoder
         # never appeared in model.model.__dict__['args'] even though the optimizer used them correctly.

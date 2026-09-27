@@ -909,6 +909,16 @@ def build_trainer(
     if tc.eval_interval > 1:
         callbacks.append(_ForceLastEpochValidationCallback())
 
+    # PerforatedAI runs last so it sees the metric COCOEvalCallback logged and the checkpoint BestModelCallback wrote
+    # before it swaps weights or restructures the model. It scores the same task metric BestModelCallback monitors.
+    if include_training_callbacks and tc.perforate:
+        # Optional-dependency boundary: rfdetr.training.perforated imports perforatedai lazily.
+        from rfdetr.training.perforated import PerforatedAICallback
+
+        _, segm_key, det_key = _BEST_MODEL_MONITOR_KEYS[tc.best_model_metric]
+        pai_key = segm_key if model_config.segmentation_head else det_key
+        callbacks.append(PerforatedAICallback(monitor=f"val/{pai_key}"))
+
     # --- Promoted config fields (T4-2 added these to TrainConfig) ---
     clip_max_norm: float = tc.clip_max_norm
     sync_bn: bool = tc.sync_bn

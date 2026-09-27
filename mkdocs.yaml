@@ -47,6 +47,7 @@ nav:
           - Custom Training API: learn/train/customization.md
           - Augmentations: learn/train/augmentations.md
           - Training Loggers: learn/train/loggers.md
+          - PerforatedAI Dendrites: learn/train/perforated.md
       - Export Model:
           - Overview: exports/index.md
           - Export Formats:

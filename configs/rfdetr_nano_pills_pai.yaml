@@ -1,0 +1,48 @@
+# RF-DETR Nano finetune on RF100-VL pills with PerforatedAI dendrites on every Linear and Conv2d layer.
+#   rfdetr fit --config configs/rfdetr_nano_pills_pai.yaml
+#   rfdetr fit --config configs/rfdetr_nano_pills_pai.yaml --model.train_config.init_args.pai_target bbox_head
+# The plain arm is the same file with perforate: false. scripts/perforated_sweep.py reads this file too. The recipe
+# values are explained in docs/learn/train/perforated.md.
+#
+# Data: RF100-VL pills, dataset index 66 (needs ROBOFLOW_API_KEY):
+#   python -c "from rf100vl import get_rf100vl_dataset_by_index as g; g(66).download('/home/ec2-user/data/rf100-vl/pill')"
+
+model:
+  model_config:
+    class_path: rfdetr.config.RFDETRNanoConfig
+    init_args:
+      num_classes: 5
+  train_config:
+    class_path: rfdetr.config.TrainConfig
+    init_args:
+      # ---- Data (COCO JSON with train/valid/test folders, the default roboflow layout) ----
+      dataset_dir: /home/ec2-user/data/rf100-vl/pill
+      output_dir: output/rfdetr_nano_pills
+      num_workers: 6
+      # ---- Horizon and batch (epoch is an upperbound since PAI handles stopping) ----
+      epochs: 2000
+      batch_size: 16
+      grad_accum_steps: 1
+      # ---- Optimizer ----
+      lr: 1.0e-4
+      lr_encoder: 1.5e-4
+      weight_decay: 1.0e-4
+      warmup_epochs: 0.0
+      # ---- Scheduling ----
+      amp_dtype: null
+      early_stopping: false
+      eval_interval: 1
+      use_ema: true
+      checkpoint_interval: 50
+      # ---- PerforatedAI ----
+      perforate: true
+      pai_target: all
+      pai_n_epochs_to_switch: 30
+      pai_p_epochs_to_switch: 4
+      pai_max_dendrites: 2
+      pai_max_dendrite_tries: 2
+      # ---- Output ----
+      wandb: true
+      tensorboard: false
+      project: detr-perforated
+      run: rfdetr_nano_pills_all

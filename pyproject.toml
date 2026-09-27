@@ -199,6 +199,12 @@ visual = [
 ]
 cli = ["jsonargparse[signatures]>=4.27.7"]
 plus = ["rfdetr_plus>=1.0.1, <2.0.0"]
+# PerforatedAI dendrite training, enabled with ``TrainConfig.perforate=True``. perforatedbp needs a license supplied
+# through environment variables; see docs/learn/train/perforated.md.
+pai = [
+    "perforatedai>=3.2.9",
+    "perforatedbp>=3.2.8",
+]
 # XLA backend for TPU training AND hardware-free XLA validation on CPU/GPU PJRT.
 # torch_xla is built on top of torch (NOT mutually exclusive — it requires torch present) and its
 # _XLAC extension is ABI-locked to ONE torch minor (a mismatch surfaces as an `undefined symbol`
@@ -495,6 +501,8 @@ overrides = [
     "deprecate", "deprecate.*",
     "faster_coco_eval", "faster_coco_eval.*",
     "ultrafast_pycocotools", "ultrafast_pycocotools.*",
+    "perforatedai", "perforatedai.*",
+    "perforatedbp", "perforatedbp.*",
     "matplotlib", "matplotlib.*",
     "pandas", "pandas.*",
     "requests", "requests.*",

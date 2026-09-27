@@ -28,6 +28,12 @@ DatasetFile: TypeAlias = Literal["coco", "o365", "roboflow", "yolo", "webdataset
 PathLikeStr: TypeAlias = str | Path
 #: Mixed-precision autocast dtype; ``None`` disables autocast (full fp32).
 AmpDtype: TypeAlias = Literal["auto", "bf16", "fp16", "fp8"] | None
+#: Modules that receive PerforatedAI dendrites when ``TrainConfig.perforate`` is set: every ``Linear`` and ``Conv2d``
+#: (``all``) or one decoder head. The module sets live in ``rfdetr.training.perforated``.
+PerforationTargetName: TypeAlias = Literal["all", "cls_head", "bbox_head", "cls_bbox_head"]
+#: Nonlinearity PerforatedAI applies to dendrite outputs: a name on ``torch`` or ``torch.nn.functional`` (``"relu"``,
+#: ``"gelu"``, ...), ``"identity"``, or a callable; ``None`` keeps the library default (sigmoid).
+PerforationForwardFunction: TypeAlias = str | Callable[[torch.Tensor], torch.Tensor] | None
 #: COCO evaluation backend selectable via ``TrainConfig.eval_backend``. The runtime registry that resolves each
 #: name lives in ``rfdetr.training.coco_map``; this alias is the single typed source of the accepted names.
 CocoEvalBackend: TypeAlias = Literal["hotcoco", "faster_coco_eval", "ufcoco", "vernier"]
@@ -1346,6 +1352,37 @@ class TrainConfig(BaseConfig):
     lr_scheduler_monitor: str = "val/loss"
     optimizer: str | Callable[..., Optimizer] = "adamw"
     optimizer_kwargs: dict[str, Any] = Field(default_factory=dict)
+    # PerforatedAI dendrite training (requires ``rfdetr[pai]``). ``perforate=True`` wraps the modules named by
+    # ``pai_target`` in PAI neuron modules after the pretrained weights load, builds the optimizer and the plateau LR
+    # schedule through PAI, and lets PAI switch between neuron and dendrite phases on the validation metric. See
+    # ``rfdetr.training.perforated`` and docs/learn/train/perforated.md.
+    perforate: bool = False
+    pai_target: PerforationTargetName = "all"
+    # Validations without improvement before PAI switches phase (neuron -> dendrite, dendrite -> neuron).
+    pai_n_epochs_to_switch: int = Field(default=30, ge=1)
+    pai_p_epochs_to_switch: int = Field(default=4, ge=1)
+    # Batches of correlation warmup before dendrite weights move. 0 resolves at train start to
+    # pai_initial_correlation_fraction of one epoch.
+    pai_initial_correlation_batches: int = Field(default=0, ge=0)
+    pai_initial_correlation_fraction: float = Field(default=0.8, gt=0.0, lt=1.0)
+    pai_max_dendrites: int = Field(default=2, ge=1)
+    pai_max_dendrite_tries: int = Field(default=2, ge=1)
+    # Epochs between forced phase switches; ``None`` keeps PAI's adaptive switching.
+    pai_fixed_switch_every: int | None = Field(default=None, ge=1)
+    pai_testing_dendrite_capacity: bool = False
+    # Wrap every non-perforated leaf module as a PAI tracked module (fallback for a perforatedbp parameter_type halt).
+    pai_track_leaves: bool = False
+    # PAI system folder name written in the working directory; ``None`` derives ``<model>_<target>_dendritic_<time>``.
+    pai_save_name: str | None = None
+    pai_load_folder: PathLikeStr | None = None
+    pai_load_stage: str = "latest"
+    # Switch to dendrite training at the first validation; the one neuron epoch before it runs at lr 0.
+    pai_force_first_switch: bool = False
+    pai_dendrite_lr: float | None = Field(default=None, gt=0.0)
+    pai_candidate_init_mult: float | None = Field(default=None, gt=0.0)
+    pai_candidate_init_by_main: bool | None = None
+    pai_global_candidates: int | None = Field(default=None, ge=1)
+    pai_forward_function: PerforationForwardFunction = None
     dont_save_weights: bool = False
     # PTL runtime/perf tuning knobs.
     train_log_sync_dist: bool = False
@@ -1608,6 +1645,49 @@ class TrainConfig(BaseConfig):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_perforate(self) -> "TrainConfig":
+        """Enforce the settings PerforatedAI dendrite training depends on.
+
+        PAI counts ``pai_n_epochs_to_switch`` in validations, so validation must run every epoch. Early stopping would
+        end the run before PAI decides to add a dendrite. The PAI callback replaces the trainer's optimizer and the EMA
+        copy in place and has only been exercised on one device, so multi-device runs are rejected. PAI owns the LR
+        schedule (a ``ReduceLROnPlateau`` it steps itself), so a configured ``lr_scheduler`` is ignored with a warning.
+        """
+        if self.pai_load_folder is not None and not self.perforate:
+            raise ValueError(
+                "pai_load_folder requires perforate=True: PAI modules must exist before a saved system loads."
+            )
+        if not self.perforate:
+            return self
+        if self.eval_interval != 1:
+            raise ValueError(
+                f"perforate=True requires eval_interval=1 (got {self.eval_interval}): PAI counts "
+                "pai_n_epochs_to_switch in validations."
+            )
+        if self.early_stopping:
+            raise ValueError("perforate=True is incompatible with early_stopping=True: PAI decides when training ends.")
+        if self.num_nodes != 1 or self.devices not in (1, "1", "auto") or self.strategy != "auto":
+            raise ValueError(
+                "perforate=True supports a single device only (num_nodes=1, devices=1 or 'auto', strategy='auto'): "
+                f"got num_nodes={self.num_nodes}, devices={self.devices!r}, strategy={self.strategy!r}."
+            )
+        if self.lr_scheduler != "step" or self.lr_scheduler_kwargs:
+            warnings.warn(
+                "perforate=True ignores lr_scheduler / lr_scheduler_kwargs: PerforatedAI builds and steps its own "
+                "ReduceLROnPlateau schedule on the validation metric.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.amp_dtype is not None:
+            warnings.warn(
+                f"perforate=True with amp_dtype={self.amp_dtype!r}: mixed precision broke dendrite training on earlier "
+                "arms. Set amp_dtype=None for the tested recipe.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _desugar_callable_lr_scheduler(cls, data: Any) -> Any:
@@ -1681,10 +1761,10 @@ class TrainConfig(BaseConfig):
             return v
         return os.path.realpath(os.path.expanduser(os.fspath(v)))
 
-    @field_validator("resume", mode="before")
+    @field_validator("resume", "pai_load_folder", mode="before")
     @classmethod
     def _coerce_resume_path(cls, v: PathLikeStr | None) -> str | None:
-        """Normalise the resume checkpoint value to ``str`` without resolving it.
+        """Normalise the resume checkpoint (or PAI system folder) value to ``str`` without resolving it.
 
         Unlike ``dataset_dir``/``output_dir``, ``resume`` is forwarded verbatim to PyTorch Lightning's
         ``trainer.fit(ckpt_path=...)``, which also accepts sentinel values such as ``"last"``. Running
