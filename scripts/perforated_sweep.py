@@ -37,7 +37,7 @@ import yaml
 import rfdetr
 from rfdetr.detr import _prepare_run_config, _save_training_config
 from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
-from rfdetr.training.perforated import PerforatedAICallback, extract_start_weights
+from rfdetr.training.perforated import KEY_MAP_NAME, PerforatedAICallback, extract_start_weights
 from rfdetr.utilities.distributed import _is_launcher_main_process
 from rfdetr.utilities.logger import get_logger
 
@@ -420,10 +420,14 @@ def resolve_start_weights(start_weights: str, training_config: str) -> str:
         logger.info("Sweep reusing %s extracted earlier from %s", plain, start)
         return str(plain)
     model_args: dict[str, Any] = {}
+    key_map: Path | None = None
     if training_config:
         with open(training_config) as handle:
             model_args = dict(json.load(handle).get("model_config", {}))
-    return str(extract_start_weights(start, plain, model_args))
+        # A run that restructured the detector into sub-blocks wrote its key map beside training_config.json.
+        candidate = Path(training_config).parent / KEY_MAP_NAME
+        key_map = candidate if candidate.is_file() else None
+    return str(extract_start_weights(start, plain, model_args, key_map_path=key_map))
 
 
 def parse_args() -> argparse.Namespace:

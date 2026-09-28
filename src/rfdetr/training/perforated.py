@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -21,9 +22,30 @@ from torch.optim.swa_utils import AveragedModel
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import ModelConfig, PerforationTargetName, TrainConfig
+from rfdetr.models.backbone.dinov2_with_windowed_attn import WindowedDinov2WithRegistersLayer
+from rfdetr.models.heads.segmentation import DepthwiseConvBlock, MLPBlock
+from rfdetr.models.transformer import Transformer, TransformerDecoderLayer
 from rfdetr.training.callbacks import RFDETREMACallback
 from rfdetr.training.callbacks.coco_eval import _get_ema_inner_module
 from rfdetr.training.param_groups import get_param_dict
+from rfdetr.training.perforated_ema import (
+    ema_update_by_name,
+    ema_weight_keys,
+    pai_buffer_names,
+    restore_weights,
+    swap_in_weights,
+    sync_resized_buffers,
+)
+from rfdetr.training.perforated_restructure import (
+    PostNormResidual,
+    PreNormBranch,
+    Recipe,
+    Restructured,
+    invert_key_map,
+    layer_with_norm,
+    remap_state_dict,
+    restructure_model,
+)
 from rfdetr.utilities.logger import get_logger
 
 if TYPE_CHECKING:
@@ -33,26 +55,422 @@ logger = get_logger()
 
 __all__ = [
     "CLEAN_MODEL_NAME",
+    "KEY_MAP_NAME",
     "PERFORATION_TARGETS",
+    "RECIPES",
     "PerforatedAICallback",
     "PerforationTarget",
     "build_perforated_save_name",
     "clean_perforated_model",
+    "configure_dendrite_copy",
     "extract_plain_state",
     "extract_start_weights",
     "get_perforation_target",
+    "install_dendrite_init_hook",
     "list_perforable_modules",
     "perforate_detection_model",
     "resolve_perforate_ids",
+    "restructure_detection_model",
     "setup_perforated_optimizer",
 ]
+
+# --- Sub-blocks -------------------------------------------------------------------------------------------------------
+# PerforatedAI perforates one module at a time and wants every normalization layer inside the module that receives
+# dendrites. RF-DETR's blocks call their norms, branches, and residual adds as siblings in one forward, so these recipes
+# rebuild each block from its existing children into sub-block modules. Pre-norm branches (DINOv2, segmentation) leave
+# the residual add in the parent block, so a dendrite is the branch alone. Post-norm blocks (decoder) keep the residual
+# and the norm inside and drop the skip in their dendrite copies (see configure_dendrite_copy).
+
+
+class PerforableDinoLayer(nn.Module):
+    """A DINOv2 block rebuilt as two pre-norm branches with the residual adds and window reshapes outside.
+
+    Args:
+        layer: The ``WindowedDinov2WithRegistersLayer`` whose children are reused.
+    """
+
+    def __init__(self, layer: WindowedDinov2WithRegistersLayer) -> None:
+        super().__init__()
+        self.num_windows = layer.num_windows
+        self.attention = PreNormBranch(layer.norm1, layer.attention, layer.layer_scale1, select=0)
+        self.drop_path = layer.drop_path
+        self.mlp = PreNormBranch(layer.norm2, layer.mlp, layer.layer_scale2)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output_attentions: bool = False,
+        run_full_attention: bool = False,
+    ) -> tuple[torch.Tensor]:
+        """Run the block; same contract as the original layer.
+
+        Args:
+            hidden_states: Windowed tokens, ``[B * num_windows**2, T, C]``.
+            output_attentions: Unsupported, as in the original layer.
+            run_full_attention: Merge the windows for this layer's attention.
+
+        Returns:
+            A one-tuple with the block output.
+        """
+        assert not output_attentions, "output_attentions is not supported for windowed attention"
+        shortcut = hidden_states
+        if run_full_attention:
+            batch_windows, tokens_per_window, channels = hidden_states.shape
+            num_windows_squared = self.num_windows**2
+            hidden_states = hidden_states.view(
+                batch_windows // num_windows_squared, num_windows_squared * tokens_per_window, channels
+            )
+        attention_output = self.attention(hidden_states, output_attentions=output_attentions)
+        if run_full_attention:
+            # Layer scale is per channel, so applying it before this view matches the original order.
+            attention_output = attention_output.view_as(shortcut)
+        hidden_states = self.drop_path(attention_output) + shortcut
+        layer_output = self.drop_path(self.mlp(hidden_states)) + hidden_states
+        return (layer_output,)
+
+
+class DecoderSelfAttention(nn.Module):
+    """The decoder layer's self-attention body, with the group-DETR query split of training mode.
+
+    Args:
+        self_attn: The layer's ``nn.MultiheadAttention``.
+        group_detr: Number of query groups attended separately while training.
+    """
+
+    def __init__(self, self_attn: nn.MultiheadAttention, group_detr: int) -> None:
+        super().__init__()
+        self.self_attn = self_attn
+        self.group_detr = group_detr
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        query_pos: torch.Tensor | None,
+        tgt_mask: torch.Tensor | None,
+        tgt_key_padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Attend the queries to each other.
+
+        Args:
+            tgt: Queries, ``[B, Q, C]``.
+            query_pos: Positional embedding added to queries and keys.
+            tgt_mask: Attention mask.
+            tgt_key_padding_mask: Key padding mask.
+
+        Returns:
+            Attention output, ``[B, Q, C]``.
+        """
+        bs, num_queries, _ = tgt.shape
+        q = k = tgt if query_pos is None else tgt + query_pos
+        v = tgt
+        if self.training:
+            q = torch.cat(q.split(num_queries // self.group_detr, dim=1), dim=0)  # type: ignore[no-untyped-call]
+            k = q
+            v = torch.cat(v.split(num_queries // self.group_detr, dim=1), dim=0)  # type: ignore[no-untyped-call]
+        tgt2 = self.self_attn(q, k, v, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask, need_weights=False)[0]
+        if self.training:
+            tgt2 = torch.cat(tgt2.split(bs, dim=0), dim=1)
+        return cast(torch.Tensor, tgt2)
+
+
+class DecoderCrossAttention(nn.Module):
+    """The decoder layer's deformable cross-attention body.
+
+    Args:
+        cross_attn: The layer's ``MSDeformAttn``.
+    """
+
+    def __init__(self, cross_attn: nn.Module) -> None:
+        super().__init__()
+        self.cross_attn = cross_attn
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        query_pos: torch.Tensor | None,
+        reference_points: torch.Tensor | None,
+        memory: torch.Tensor,
+        spatial_shapes: torch.Tensor | None,
+        level_start_index: torch.Tensor | None,
+        memory_key_padding_mask: torch.Tensor | None,
+        spatial_shapes_hw: list[tuple[int, int]] | None,
+    ) -> torch.Tensor:
+        """Attend the queries to the encoder memory.
+
+        Args:
+            tgt: Queries, ``[B, Q, C]``.
+            query_pos: Positional embedding added to the queries.
+            reference_points: Sampling reference points.
+            memory: Encoder memory.
+            spatial_shapes: Feature level shapes.
+            level_start_index: Start index of every level in ``memory``.
+            memory_key_padding_mask: Memory padding mask.
+            spatial_shapes_hw: Feature level shapes as Python ints.
+
+        Returns:
+            Attention output, ``[B, Q, C]``.
+        """
+        query = tgt if query_pos is None else tgt + query_pos
+        out = self.cross_attn(
+            query,
+            reference_points,
+            memory,
+            spatial_shapes,
+            level_start_index,
+            memory_key_padding_mask,
+            input_spatial_shapes_hw=spatial_shapes_hw,
+        )
+        return cast(torch.Tensor, out)
+
+
+class DecoderFeedForward(nn.Module):
+    """The decoder layer's FFN body ``linear2(dropout(activation(linear1(x))))``.
+
+    Args:
+        linear1: First projection.
+        activation: Activation function between the projections.
+        dropout: Dropout after the activation.
+        linear2: Second projection.
+    """
+
+    def __init__(
+        self,
+        linear1: nn.Linear,
+        activation: Callable[[torch.Tensor], torch.Tensor],
+        dropout: nn.Module,
+        linear2: nn.Linear,
+    ) -> None:
+        super().__init__()
+        self.linear1 = linear1
+        self.activation = activation
+        self.dropout = dropout
+        self.linear2 = linear2
+
+    def forward(self, tgt: torch.Tensor) -> torch.Tensor:
+        """Apply the FFN to ``[B, Q, C]`` queries."""
+        # The original layer computes exactly this before its third residual add.
+        return self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+
+
+class PerforableDecoderLayer(nn.Module):
+    """A decoder layer rebuilt as three post-norm residual blocks.
+
+    Args:
+        layer: The ``TransformerDecoderLayer`` whose children are reused.
+
+    Raises:
+        ValueError: If the layer runs the keypoint subnetwork, which ``perforate=True`` does not support.
+    """
+
+    def __init__(self, layer: TransformerDecoderLayer) -> None:
+        super().__init__()
+        if layer.enable_keypoint_processing:
+            raise ValueError("Block perforation does not support the keypoint decoder layer.")
+        self.self_attn = PostNormResidual(
+            DecoderSelfAttention(layer.self_attn, layer.group_detr), layer.dropout1, layer.norm1
+        )
+        self.cross_attn = PostNormResidual(DecoderCrossAttention(layer.cross_attn), layer.dropout2, layer.norm2)
+        self.ffn = PostNormResidual(
+            DecoderFeedForward(layer.linear1, layer.activation, layer.dropout, layer.linear2),
+            layer.dropout3,
+            layer.norm3,
+        )
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        memory_key_padding_mask: torch.Tensor | None = None,
+        query_pos: torch.Tensor | None = None,
+        reference_points: torch.Tensor | None = None,
+        spatial_shapes: torch.Tensor | None = None,
+        spatial_shapes_hw: list[tuple[int, int]] | None = None,
+        level_start_index: torch.Tensor | None = None,
+        keypoint_tgt: torch.Tensor | None = None,
+        keypoint_pos: torch.Tensor | None = None,
+        keypoint_class_mask: torch.Tensor | None = None,
+        kp_cross_attn_memory: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the layer; same contract as ``TransformerDecoderLayer.forward`` without keypoints.
+
+        Args:
+            tgt: Queries, ``[B, Q, C]``.
+            memory: Encoder memory.
+            tgt_mask: Self-attention mask.
+            memory_mask: Unused, kept for the call signature.
+            tgt_key_padding_mask: Self-attention key padding mask.
+            memory_key_padding_mask: Memory padding mask.
+            query_pos: Query positional embedding.
+            reference_points: Deformable attention reference points.
+            spatial_shapes: Feature level shapes.
+            spatial_shapes_hw: Feature level shapes as Python ints.
+            level_start_index: Start index of every level in ``memory``.
+            keypoint_tgt: Must be ``None``.
+            keypoint_pos: Must be ``None``.
+            keypoint_class_mask: Must be ``None``.
+            kp_cross_attn_memory: Must be ``None``.
+
+        Returns:
+            Updated queries, ``[B, Q, C]``.
+        """
+        if any(v is not None for v in (keypoint_tgt, keypoint_pos, keypoint_class_mask, kp_cross_attn_memory)):
+            raise ValueError("Block perforation does not support the keypoint decoder layer.")
+        tgt = self.self_attn(tgt, query_pos, tgt_mask, tgt_key_padding_mask)
+        tgt = self.cross_attn(
+            tgt,
+            query_pos,
+            reference_points,
+            memory,
+            spatial_shapes,
+            level_start_index,
+            memory_key_padding_mask,
+            spatial_shapes_hw,
+        )
+        return cast(torch.Tensor, self.ffn(tgt))
+
+
+def restructure_two_stage(transformer: Transformer) -> Transformer:
+    """Group every two-stage ``enc_output[i]`` Linear with its ``enc_output_norm[i]`` in place.
+
+    ``enc_output_norm[i]`` becomes an identity so the transformer's forward is unchanged. The stacked fast path checks
+    for plain ``nn.Linear`` / ``nn.LayerNorm`` and falls back to the per-group loop on its own.
+
+    Args:
+        transformer: The detector's ``Transformer``.
+
+    Returns:
+        The same transformer.
+    """
+    enc_output = getattr(transformer, "enc_output", None)
+    enc_output_norm = getattr(transformer, "enc_output_norm", None)
+    if enc_output is None or enc_output_norm is None:
+        return transformer
+    for index in range(len(enc_output)):
+        enc_output[index] = layer_with_norm(enc_output[index], enc_output_norm[index])
+        enc_output_norm[index] = nn.Identity()
+    return transformer
+
+
+class ParameterScale(nn.Module):
+    """Multiply by a per-channel parameter, so a bare ``gamma`` parameter can sit in a branch's ``scale`` slot.
+
+    Args:
+        weight: The existing parameter, reused as is.
+    """
+
+    def __init__(self, weight: nn.Parameter) -> None:
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale ``x`` along its last axis."""
+        # Same broadcast as the ``gamma * x`` the segmentation blocks compute.
+        return x * self.weight
+
+
+class DepthwiseBranch(DepthwiseConvBlock):
+    """The segmentation ``DepthwiseConvBlock`` without its residual add.
+
+    Subclassing keeps the block's cuDNN-free depthwise convolution.
+
+    Args:
+        block: The block whose children are reused.
+    """
+
+    neuron_axis: int = 1
+
+    def __init__(self, block: DepthwiseConvBlock) -> None:
+        nn.Module.__init__(self)
+        self.dwconv = block.dwconv
+        self.norm = block.norm
+        self.pwconv1 = block.pwconv1
+        self.act = block.act
+        self.gamma = block.gamma
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the branch to ``[B, C, H, W]`` features and return ``[B, C, H, W]``."""
+        x = self._depthwise_conv(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.act(self.pwconv1(self.norm(x)))
+        if self.gamma is not None:
+            x = self.gamma * x
+        return x.permute(0, 3, 1, 2)
+
+
+class PerforableDepthwiseConvBlock(nn.Module):
+    """A segmentation ``DepthwiseConvBlock`` rebuilt as a branch plus an outside residual add.
+
+    Args:
+        block: The block whose children are reused.
+    """
+
+    def __init__(self, block: DepthwiseConvBlock) -> None:
+        super().__init__()
+        self.branch = DepthwiseBranch(block)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the block on ``[B, C, H, W]`` features."""
+        # The residual add stays out here so a dendrite of the branch carries no skip connection.
+        return x + self.branch(x)
+
+
+class SegmentationMLPBranch(PreNormBranch):
+    """The segmentation ``MLPBlock`` branch; a distinct type so targets can name it apart from the backbone's."""
+
+
+class PerforableMLPBlock(nn.Module):
+    """A segmentation ``MLPBlock`` rebuilt as a pre-norm branch plus an outside residual add.
+
+    Args:
+        block: The block whose children are reused.
+    """
+
+    def __init__(self, block: MLPBlock) -> None:
+        super().__init__()
+        scale = ParameterScale(block.gamma) if block.gamma is not None else None
+        self.branch = SegmentationMLPBranch(block.norm_in, nn.Sequential(*block.layers), scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the block on ``[B, N, C]`` query features."""
+        # The residual add stays out here so a dendrite of the branch carries no skip connection.
+        return x + self.branch(x)
+
+
+#: Exact module type to the recipe that rebuilds it, applied by :func:`restructure_detection_model`.
+RECIPES: dict[type[nn.Module], Recipe] = {
+    WindowedDinov2WithRegistersLayer: PerforableDinoLayer,
+    TransformerDecoderLayer: PerforableDecoderLayer,
+    Transformer: restructure_two_stage,
+    DepthwiseConvBlock: PerforableDepthwiseConvBlock,
+    MLPBlock: PerforableMLPBlock,
+}
+
+#: File in ``output_dir`` mapping original state-dict keys to the restructured ones.
+KEY_MAP_NAME = "pai_key_map.json"
+
+
+def restructure_detection_model(model: nn.Module) -> Restructured:
+    """Apply :data:`RECIPES` to a detector.
+
+    Args:
+        model: ``LWDETR`` with pretrained weights already loaded.
+
+    Returns:
+        The restructured model with its key map.
+    """
+    # A thin name for the detector so callers do not pass the recipe table around.
+    return restructure_model(model, RECIPES)
+
 
 # --- Targets ----------------------------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class PerforationTarget:
-    """Detector Modules that receive dendrites
+    """Detector modules that receive dendrites.
 
     The neuron axis of every wrapped module is measured by :func:`record_forward_stats`, so a target only names modules.
 
@@ -64,6 +482,8 @@ class PerforationTarget:
             :func:`perforate_detection_model` adds every candidate called more than once per forward, which PAI's
             perforated backpropagation cannot pair with a single error.
         track_ids: Module ids PAI wraps in ``TrackedNeuronModule``; ``pai_track_leaves`` fills it.
+        restructure: Rebuild the detector's blocks into sub-blocks (:data:`RECIPES`) before wrapping. Block targets
+            need it, since the sub-block modules only exist after it.
     """
 
     name: str
@@ -71,44 +491,107 @@ class PerforationTarget:
     perforate_type_names: tuple[str, ...] = ()
     skip_ids: tuple[str, ...] = ()
     track_ids: tuple[str, ...] = ()
+    restructure: bool = False
 
 
 ALL = PerforationTarget(name="all", perforate_type_names=("Linear", "Conv2d"))
 CLS_HEAD = PerforationTarget(name="cls_head", perforate_ids=(".class_embed",))
 BBOX_HEAD = PerforationTarget(name="bbox_head", perforate_ids=(".bbox_embed",))
 CLS_BBOX_HEAD = PerforationTarget(name="cls_bbox_head", perforate_ids=(".class_embed", ".bbox_embed"))
+#: DINOv2 attention and FFN branches, norms inside, residual adds outside.
+BACKBONE_BLOCKS = PerforationTarget(name="backbone_blocks", perforate_type_names=("PreNormBranch",), restructure=True)
+#: Decoder self-attention, cross-attention, and FFN blocks with their post-norms.
+DECODER_BLOCKS = PerforationTarget(name="decoder_blocks", perforate_type_names=("PostNormResidual",), restructure=True)
+#: Two-stage ``enc_output`` Linear + LayerNorm pairs.
+ENC_OUTPUT = PerforationTarget(name="enc_output", perforate_type_names=("PAISequential",), restructure=True)
+#: Projector conv + norm units; the bottleneck residual adds stay outside them.
+PROJECTOR_BLOCKS = PerforationTarget(name="projector_blocks", perforate_type_names=("ConvX",))
+#: Segmentation head branches.
+SEGMENTATION_BLOCKS = PerforationTarget(
+    name="segmentation_blocks", perforate_type_names=("DepthwiseBranch", "SegmentationMLPBranch"), restructure=True
+)
+#: Every block above plus the detection heads.
+ALL_BLOCKS = PerforationTarget(
+    name="all_blocks",
+    perforate_ids=(".class_embed",),
+    perforate_type_names=(
+        BACKBONE_BLOCKS.perforate_type_names
+        + DECODER_BLOCKS.perforate_type_names
+        + ENC_OUTPUT.perforate_type_names
+        + PROJECTOR_BLOCKS.perforate_type_names
+        + SEGMENTATION_BLOCKS.perforate_type_names
+        + ("MLP",)
+    ),
+    restructure=True,
+)
 
 #: Targets selectable through ``TrainConfig.pai_target``.
-PERFORATION_TARGETS: dict[str, PerforationTarget] = {t.name: t for t in (ALL, CLS_HEAD, BBOX_HEAD, CLS_BBOX_HEAD)}
+PERFORATION_TARGETS: dict[str, PerforationTarget] = {
+    t.name: t
+    for t in (
+        ALL,
+        CLS_HEAD,
+        BBOX_HEAD,
+        CLS_BBOX_HEAD,
+        BACKBONE_BLOCKS,
+        DECODER_BLOCKS,
+        ENC_OUTPUT,
+        PROJECTOR_BLOCKS,
+        SEGMENTATION_BLOCKS,
+        ALL_BLOCKS,
+    )
+}
 
 #: Module types :func:`list_perforable_modules` reports and :func:`record_forward_stats` measures.
-PERFORABLE_TYPE_NAMES = ("Linear", "Conv2d", "LayerNorm", "Embedding", "MLP")
+PERFORABLE_TYPE_NAMES = (
+    "Linear",
+    "Conv2d",
+    "LayerNorm",
+    "Embedding",
+    "MLP",
+    "ConvX",
+    "PreNormBranch",
+    "PostNormResidual",
+    "PAISequential",
+    "DepthwiseBranch",
+    "SegmentationMLPBranch",
+)
+
+#: Module types whose output keeps channels at axis 1 (``[B, C, H, W]``); everything else has channels last.
+CHANNELS_FIRST_TYPE_NAMES = ("Conv2d", "ConvTranspose2d", "ConvX", "BatchNorm2d")
 
 
-def get_perforation_target(name: PerforationTargetName | str) -> PerforationTarget:
-    """Look up a target by name.
+def get_perforation_target(target: PerforationTargetName | str | list[str] | tuple[str, ...]) -> PerforationTarget:
+    """Look up a target by name, or build one from explicit module ids.
 
     Args:
-        name: One of the keys of :data:`PERFORATION_TARGETS`.
+        target: One of the keys of :data:`PERFORATION_TARGETS`, or a list of module ids with a leading dot. Ids may
+            name sub-blocks, so an id list restructures the detector first.
 
     Returns:
         The matching :class:`PerforationTarget`.
 
     Raises:
-        ValueError: If ``name`` is not a known target.
+        ValueError: If a name is unknown or an id lacks its leading dot.
     """
+    if not isinstance(target, str):
+        ids = tuple(target)
+        bad = [i for i in ids if not i.startswith(".")]
+        if not ids or bad:
+            raise ValueError(f"pai_target ids must start with '.', like '.class_embed'; got {bad or ids}.")
+        return PerforationTarget(name="custom", perforate_ids=ids, restructure=True)
     try:
-        return PERFORATION_TARGETS[name]
+        return PERFORATION_TARGETS[target]
     except KeyError:
         known = ", ".join(sorted(PERFORATION_TARGETS))
-        raise ValueError(f"Unknown pai_target {name!r}; choose from {known}.") from None
+        raise ValueError(f"Unknown pai_target {target!r}; choose from {known} or pass a list of module ids.") from None
 
 
 def list_perforable_modules(model: nn.Module) -> dict[str, str]:
     """Map every weight-carrying module id of the detector to its type name.
 
     Args:
-        model: ``LWDETR`` before PAI converts it.
+        model: ``LWDETR`` before PAI converts it, restructured if block ids are wanted.
 
     Returns:
         ``{module_id: type_name}`` for every module whose type is in :data:`PERFORABLE_TYPE_NAMES`.
@@ -135,7 +618,7 @@ def check_target_ids(model: nn.Module, target: PerforationTarget) -> None:
     if missing:
         raise ValueError(
             f"Target {target.name!r} names modules the detector does not have: {missing}. "
-            "Run list_perforable_modules on the model for the ids it does have."
+            "Run list_perforable_modules on the (restructured) model for the ids it does have."
         )
 
 
@@ -199,7 +682,11 @@ def build_tracked_leaf_ids(model: nn.Module, target: PerforationTarget) -> list[
     return ids
 
 
-def record_forward_stats(model: nn.Module, sample: torch.Tensor) -> tuple[dict[str, int], dict[str, int]]:
+def record_forward_stats(
+    model: nn.Module,
+    sample: torch.Tensor,
+    module_ids: tuple[str, ...] = (),
+) -> tuple[dict[str, int], dict[str, int]]:
     """Run one forward of the unperforated model and measure every perforable module.
 
     The pass runs in train mode because RF-DETR calls the extra ``group_detr`` head copies only while training.
@@ -208,10 +695,11 @@ def record_forward_stats(model: nn.Module, sample: torch.Tensor) -> tuple[dict[s
     Args:
         model: ``LWDETR`` before PAI converts it.
         sample: Image batch of at least two images, ``[B, 3, H, W]``, on the model's device.
+        module_ids: Ids measured in addition to every module whose type is in :data:`PERFORABLE_TYPE_NAMES`.
 
     Returns:
-        ``(ranks, calls)``: the output rank and the number of calls per forward of every module whose type is in
-        :data:`PERFORABLE_TYPE_NAMES`, keyed by module id.
+        ``(ranks, calls)``: the output rank and the number of calls per forward of every measured module, keyed by
+        module id. A module whose output is not a tensor gets a call count but no rank.
     """
     ranks: dict[str, int] = {}
     calls: dict[str, int] = {}
@@ -227,7 +715,7 @@ def record_forward_stats(model: nn.Module, sample: torch.Tensor) -> tuple[dict[s
     handles = [
         module.register_forward_hook(make_hook("." + name))
         for name, module in model.named_modules()
-        if name and type(module).__name__ in PERFORABLE_TYPE_NAMES
+        if name and (type(module).__name__ in PERFORABLE_TYPE_NAMES or "." + name in module_ids)
     ]
     buffers = {name: buffer.clone() for name, buffer in model.named_buffers()}
     was_training = model.training
@@ -245,18 +733,26 @@ def record_forward_stats(model: nn.Module, sample: torch.Tensor) -> tuple[dict[s
     return ranks, calls
 
 
-def output_dimensions_for(type_name: str, rank: int) -> list[int]:
+def output_dimensions_for(module: nn.Module, rank: int) -> list[int]:
     """Return PAI's output dimension vector: ``0`` at the neuron axis, ``-1`` elsewhere.
 
+    A module declaring ``neuron_axis`` (the sub-blocks) decides for itself. Otherwise convolution-like types keep
+    channels at axis 1 and everything else at the end, which also covers a Linear applied to 4D stacked outputs.
+
     Args:
-        type_name: Type name of the wrapped module. Convolutions keep channels at axis 1; everything else at the end.
+        module: The module PAI wrapped (the ``main_module``).
         rank: Rank of the module output.
 
     Returns:
         A list of length ``rank`` with a single ``0``.
     """
+    axis = getattr(module, "neuron_axis", None)
+    if axis is None:
+        axis = 1 if type(module).__name__ in CHANNELS_FIRST_TYPE_NAMES else rank - 1
+    if axis < 0:
+        axis += rank
     dims = [-1] * rank
-    dims[1 if type_name.startswith("Conv") else rank - 1] = 0
+    dims[axis] = 0
     return dims
 
 
@@ -268,15 +764,81 @@ def apply_output_dimensions(model: nn.Module, ranks: dict[str, int]) -> None:
         ranks: ``{module_id: output.ndim}`` of the unperforated model.
 
     Raises:
-        ValueError: If a wrapped module was not called during the measuring forward.
+        ValueError: If a wrapped module was not called during the measuring forward or returned no tensor.
     """
     wrapped = [module for module in model.modules() if type(module).__name__ == "PAINeuronModule"]
     missing = [str(module.name) for module in wrapped if str(module.name) not in ranks]
     if missing:
-        raise ValueError(f"PerforatedAI wrapped modules the measuring forward never called: {missing}.")
+        raise ValueError(
+            f"PerforatedAI wrapped modules the measuring forward never called or that return no tensor: {missing}."
+        )
     for module in wrapped:
-        type_name = type(module.get_submodule("main_module")).__name__
-        cast(Any, module).set_this_output_dimensions(output_dimensions_for(type_name, ranks[str(module.name)]))
+        main = module.get_submodule("main_module")
+        cast(Any, module).set_this_output_dimensions(output_dimensions_for(main, ranks[str(module.name)]))
+
+
+# --- Dendrite copies --------------------------------------------------------------------------------------------------
+# PerforatedAI builds every dendrite candidate as a deep copy of the wrapped module and re-randomizes all of its
+# parameters (modules_perforatedai.init_params). For a sub-block that is wrong twice over: a post-norm block would keep
+# its skip connection, and norm affine and layer-scale weights would start at random values instead of the neuron's.
+# Until the library grows the hook, init_params is wrapped here to fix both on every copy.
+
+#: Normalization module type names whose parameters a dendrite copy inherits from the neuron.
+NORM_TYPE_NAMES = ("LayerNorm", "BatchNorm1d", "BatchNorm2d", "BatchNorm3d", "GroupNorm", "RMSNorm")
+
+_dendrite_copies_configured = 0
+
+
+def configure_dendrite_copy(module: nn.Module, main: nn.Module) -> None:
+    """Finish a fresh dendrite copy after PAI re-randomized its parameters.
+
+    Calls ``configure_as_dendrite`` when the module defines it (post-norm blocks drop their skip), then copies the
+    parameters of every normalization module and of every scale-only module (all own parameters 1D, like layer scale
+    or ``gamma``) back from the neuron's ``main_module``.
+
+    Args:
+        module: The dendrite copy PAI just initialized.
+        main: The neuron's ``main_module`` the copy was made from.
+    """
+    global _dendrite_copies_configured
+    configure = getattr(module, "configure_as_dendrite", None)
+    if callable(configure):
+        configure()
+    main_params = dict(main.named_parameters())
+    with torch.no_grad():
+        for name, sub in module.named_modules():
+            own = list(sub.named_parameters(recurse=False))
+            if not own:
+                continue
+            scale_only = all(p.ndim <= 1 for _, p in own)
+            if type(sub).__name__ not in NORM_TYPE_NAMES and not scale_only:
+                continue
+            for param_name, param in own:
+                full = f"{name}.{param_name}" if name else param_name
+                source = main_params.get(full)
+                if source is not None and source.shape == param.shape:
+                    param.copy_(source)
+    _dendrite_copies_configured += 1
+
+
+def install_dendrite_init_hook() -> None:
+    """Wrap ``modules_perforatedai.init_params`` so :func:`configure_dendrite_copy` runs on every dendrite copy.
+
+    Idempotent. ``create_new_dendrite_module`` looks ``init_params`` up as a module global at call time, which is
+    what makes the wrap take effect.
+    """
+    from perforatedai import modules_perforatedai as mpa
+
+    original = mpa.init_params
+    if getattr(original, "_rfdetr_wrapped", False):
+        return
+
+    def init_params(module: nn.Module, neuron_main_module: nn.Module) -> None:
+        original(module, neuron_main_module)
+        configure_dendrite_copy(module, neuron_main_module)
+
+    init_params._rfdetr_wrapped = True  # type: ignore[attr-defined]
+    mpa.init_params = init_params
 
 
 # --- PAI configuration and wrapping -----------------------------------------------------------------------------------
@@ -344,8 +906,9 @@ def build_perforated_save_name(model_config: ModelConfig, train_config: TrainCon
     if train_config.pai_save_name:
         return train_config.pai_save_name
     model_label = model_config.model_name or type(model_config).__name__.removesuffix("Config")
+    target_name = get_perforation_target(train_config.pai_target).name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{model_label.lower()}_{train_config.pai_target}_dendritic_{timestamp}"
+    return f"{model_label.lower()}_{target_name}_dendritic_{timestamp}"
 
 
 def configure_perforated_ai(model: nn.Module, target: PerforationTarget, train_config: TrainConfig) -> None:
@@ -420,8 +983,25 @@ def verify_perforated_wrapping(model: nn.Module, expected_ids: tuple[str, ...]) 
     logger.info("PerforatedAI wrapped %d modules, as requested", len(wrapped))
 
 
+def write_key_map(key_map: dict[str, str], output_dir: str | Path) -> Path:
+    """Write the restructure key map next to the run's checkpoints.
+
+    Args:
+        key_map: ``{original_key: restructured_key}`` from :func:`restructure_detection_model`.
+        output_dir: The run's ``output_dir``.
+
+    Returns:
+        Path of the written file.
+    """
+    path = Path(output_dir) / KEY_MAP_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        json.dump(key_map, handle, indent=1, sort_keys=True)
+    return path
+
+
 def perforate_detection_model(model: nn.Module, model_config: ModelConfig, train_config: TrainConfig) -> nn.Module:
-    """Configure PAI, wrap the detector, verify the wrapping, and optionally load a saved PAI system.
+    """Restructure if the target needs it, configure PAI, wrap the detector, verify, and optionally load a saved system.
 
     Args:
         model: ``LWDETR`` with pretrained weights already loaded.
@@ -433,12 +1013,25 @@ def perforate_detection_model(model: nn.Module, model_config: ModelConfig, train
     """
     gpa, upa = import_perforatedai()
     target = get_perforation_target(train_config.pai_target)
+    if target.restructure:
+        restructured = restructure_detection_model(model)
+        model = restructured.model
+        moved = sum(1 for old, new in restructured.key_map.items() if old != new)
+        key_map_path = write_key_map(restructured.key_map, train_config.output_dir)
+        logger.info(
+            "PerforatedAI restructured %d blocks into sub-blocks (%d state dict keys renamed, map at %s)",
+            len(restructured.replaced),
+            moved,
+            key_map_path,
+        )
+    install_dendrite_init_hook()
     if train_config.pai_track_leaves:
         target = replace(target, track_ids=tuple(build_tracked_leaf_ids(model, target)))
         logger.info("PerforatedAI tracking %d leaf modules", len(target.track_ids))
     device = next(model.parameters()).device
     resolution = model_config.resolution
-    ranks, calls = record_forward_stats(model, torch.zeros(2, 3, resolution, resolution, device=device))
+    sample = torch.zeros(2, 3, resolution, resolution, device=device)
+    ranks, calls = record_forward_stats(model, sample, module_ids=resolve_perforate_ids(model, target))
     # PAI's perforated backpropagation pairs one output with one error per module per step, so a candidate RF-DETR
     # calls more than once per forward (the two-stage class-head copies) is tracked instead of perforated.
     multi_call = tuple(i for i in resolve_perforate_ids(model, target) if calls.get(i, 0) > 1)
@@ -649,10 +1242,9 @@ def setup_perforated_optimizer(pl_module: RFDETRModelModule) -> optim.Optimizer:
     return optimizer
 
 
-# --- EMA bookkeeping --------------------------------------------------------------------------------------------------
-# AveragedModel pairs tensors by position, but PAI registers buffers lazily and resizes some at every validation, so
-# the EMA update is replaced by one that pairs by name. PAI's own buffers (integer indices, tracker_string) are copied
-# rather than averaged: averaging an index through float rounding once broadcast the dendrite weights on the wrong axis.
+# --- EMA glue ---------------------------------------------------------------------------------------------------------
+# The framework-free half lives in rfdetr.training.perforated_ema. These functions bind it to RFDETREMACallback's
+# AveragedModel, whose positional update_parameters is replaced by the by-name update.
 
 
 def find_ema_callback(trainer: Trainer) -> RFDETREMACallback | None:
@@ -663,51 +1255,31 @@ def find_ema_callback(trainer: Trainer) -> RFDETREMACallback | None:
     return None
 
 
-def ema_weight_keys(model: nn.Module) -> set[str]:
-    """State dict keys the EMA averages and validation scores: parameters plus norm running stats.
+def install_named_ema_update(ema_cb: RFDETREMACallback, pl_module: RFDETRModelModule) -> None:
+    """Replace ``AveragedModel.update_parameters`` with the by-name update that mirrors PAI's buffers.
 
     Args:
-        model: Live perforated ``LWDETR``.
-
-    Returns:
-        Parameter names plus ``running_mean`` / ``running_var`` buffer names.
+        ema_cb: EMA callback holding the averaged copy.
+        pl_module: Module holding the live perforated ``LWDETR`` at ``.model``.
     """
-    keys = {name for name, _ in model.named_parameters()}
-    keys |= {name for name, _ in model.named_buffers() if name.endswith(("running_mean", "running_var"))}
-    return keys
+    average_model = getattr(ema_cb, "_average_model", None)
+    if average_model is None:
+        return
+    # The averaged copy wraps the LightningModule, so its names carry the ``model.`` prefix.
+    mirror = {"model." + name for name in pai_buffer_names(pl_module.model)}
+
+    def update_parameters(model: LightningModule) -> None:
+        n_averaged = int(average_model.n_averaged.item())
+        ema_update_by_name(
+            average_model.module, model, ema_cb._effective_decay(n_averaged), mirror, first_update=n_averaged == 0
+        )
+        average_model.n_averaged += 1
+
+    average_model.update_parameters = update_parameters
 
 
-def pai_buffer_names(model: nn.Module) -> set[str]:
-    """State dict keys of the buffers under every ``PAINeuronModule``.
-
-    Args:
-        model: Live perforated ``LWDETR``.
-
-    Returns:
-        Buffer names PAI keeps for bookkeeping.
-    """
-    prefixes = [name + "." for name, module in model.named_modules() if type(module).__name__ == "PAINeuronModule"]
-    return {name for name, _ in model.named_buffers() if any(name.startswith(p) for p in prefixes)}
-
-
-def replace_buffer(root: nn.Module, name: str, tensor: torch.Tensor) -> None:
-    """Re-register a nested buffer with a copy of ``tensor``, for buffers whose shape changed.
-
-    Args:
-        root: Module the dotted name is relative to.
-        name: Dotted state dict name of the buffer.
-        tensor: Tensor whose copy becomes the buffer.
-    """
-    owner = root
-    parts = name.split(".")
-    for part in parts[:-1]:
-        owner = getattr(owner, part)
-    owner.register_buffer(parts[-1], tensor.detach().clone())
-
-
-@torch.no_grad()
-def sync_resized_buffers(pl_module: LightningModule, ema_cb: RFDETREMACallback) -> int:
-    """Replace every integer buffer of the EMA copy whose live shape changed since the last step.
+def sync_ema_buffers(pl_module: RFDETRModelModule, ema_cb: RFDETREMACallback) -> int:
+    """Re-register every integer buffer of the EMA copy whose live shape changed since the last step.
 
     Args:
         pl_module: Module holding the live perforated ``LWDETR`` at ``.model``.
@@ -719,61 +1291,7 @@ def sync_resized_buffers(pl_module: LightningModule, ema_cb: RFDETREMACallback) 
     average_model = getattr(ema_cb, "_average_model", None)
     if average_model is None:
         return 0
-    ema_buffers = dict(average_model.module.named_buffers())
-    replaced = 0
-    for name, live_t in pl_module.named_buffers():
-        ema_t = ema_buffers.get(name)
-        if ema_t is None or ema_t.is_floating_point():
-            continue
-        if ema_t.shape != live_t.shape:
-            replace_buffer(average_model.module, name, live_t)
-            replaced += 1
-    return replaced
-
-
-def install_named_ema_update(ema_cb: RFDETREMACallback, pl_module: RFDETRModelModule) -> None:
-    """Replace ``AveragedModel.update_parameters`` with a by-name update that mirrors PAI's buffers.
-
-    Args:
-        ema_cb: EMA callback holding the averaged copy.
-        pl_module: Module holding the live perforated ``LWDETR`` at ``.model``.
-    """
-    average_model = getattr(ema_cb, "_average_model", None)
-    if average_model is None:
-        return
-    skip = {"model." + name for name in pai_buffer_names(pl_module.model)}
-
-    @torch.no_grad()
-    def update_parameters(model: LightningModule) -> None:
-        n_averaged = int(average_model.n_averaged.item())
-        decay = ema_cb._effective_decay(n_averaged)
-        ema_tensors: dict[str, torch.Tensor] = dict(average_model.module.named_parameters())
-        ema_tensors.update(average_model.module.named_buffers())
-        live_tensors: dict[str, torch.Tensor] = dict(model.named_parameters())
-        live_tensors.update(model.named_buffers())
-        groups: dict[tuple[torch.device, torch.dtype], tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
-        for name, ema_t in ema_tensors.items():
-            live_t = live_tensors.get(name)
-            if live_t is None:
-                continue
-            if live_t.shape != ema_t.shape:
-                if not ema_t.is_floating_point():
-                    replace_buffer(average_model.module, name, live_t)
-                continue
-            mirror = name in skip or n_averaged == 0 or not ema_t.is_floating_point()
-            if mirror:
-                ema_t.copy_(live_t)
-                continue
-            key = (ema_t.device, ema_t.dtype)
-            averaged, current = groups.setdefault(key, ([], []))
-            averaged.append(ema_t)
-            current.append(live_t.to(ema_t.dtype))
-        for averaged, current in groups.values():
-            torch._foreach_mul_(averaged, decay)
-            torch._foreach_add_(averaged, current, alpha=1.0 - decay)
-        average_model.n_averaged += 1
-
-    average_model.update_parameters = update_parameters
+    return sync_resized_buffers(average_model.module, pl_module)
 
 
 def rebuild_ema(ema_cb: RFDETREMACallback, pl_module: RFDETRModelModule) -> None:
@@ -813,7 +1331,6 @@ def check_ema_buffers(pl_module: RFDETRModelModule, ema_cb: RFDETREMACallback) -
     logger.info("PerforatedAI rebuilt the EMA copy: live model has %d buffers, copy had %d", len(live), len(ema))
 
 
-@torch.no_grad()
 def swap_in_ema_weights(pl_module: RFDETRModelModule, ema_cb: RFDETREMACallback) -> dict[str, torch.Tensor]:
     """Copy the EMA weights into the live detector in place, so PAI checkpoints the weights that were scored.
 
@@ -827,13 +1344,7 @@ def swap_in_ema_weights(pl_module: RFDETRModelModule, ema_cb: RFDETREMACallback)
     ema_inner = _get_ema_inner_module(ema_cb)
     if ema_inner is None:
         return {}
-    live = pl_module.model.state_dict()
-    ema = ema_inner.model.state_dict()
-    saved: dict[str, torch.Tensor] = {}
-    for key in ema_weight_keys(pl_module.model):
-        saved[key] = live[key].clone()
-        live[key].copy_(ema[key])
-    return saved
+    return swap_in_weights(pl_module.model, ema_inner.model, ema_weight_keys(pl_module.model))
 
 
 # --- Dendrite scores --------------------------------------------------------------------------------------------------
@@ -1002,6 +1513,7 @@ class PerforatedAICallback(Callback):
         ema_cb = find_ema_callback(trainer)
         saved = swap_in_ema_weights(module, ema_cb) if ema_cb is not None else {}
         device = module.device
+        copies_before = _dendrite_copies_configured
         model, restructured, training_complete = gpa.pai_tracker.add_validation_score(
             score, module.model, force_switch=force
         )
@@ -1027,11 +1539,9 @@ class PerforatedAICallback(Callback):
             trainer.should_stop = True
             return
         if not restructured:
-            live = module.model.state_dict()
-            for key, tensor in saved.items():
-                live[key].copy_(tensor)
+            restore_weights(module.model, saved)
             if ema_cb is not None:
-                sync_resized_buffers(module, ema_cb)
+                sync_ema_buffers(module, ema_cb)
             return
 
         module.model = model.to(device)
@@ -1048,11 +1558,13 @@ class PerforatedAICallback(Callback):
         params = sum(p.numel() for p in module.model.parameters())
         logger.info(
             "PerforatedAI restructured at epoch %d into mode %s with %d parameters. Rebuilt the optimizer with AdamW "
-            "state restored on %d tensors, a fresh plateau schedule, and the EMA.",
+            "state restored on %d tensors, a fresh plateau schedule, and the EMA. Dendrite init hook configured %d "
+            "copies.",
             trainer.current_epoch,
             gpa.pai_tracker.member_vars["mode"],
             params,
             restored,
+            _dendrite_copies_configured - copies_before,
         )
 
     def on_train_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
@@ -1110,7 +1622,8 @@ def extract_plain_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
         state: State dict read from a PAI stage file (``<folder>/<stage>.pt``, safetensors).
 
     Returns:
-        A state dict that loads into a plain ``LWDETR``.
+        A state dict with the wrapped modules' own tensors back at their pre-wrapping keys. If the run restructured the
+        detector these are the sub-block keys; :func:`extract_start_weights` maps them back with the run's key map.
     """
     prefixes = sorted({key.split(_MAIN_MODULE_SEGMENT)[0] for key in state if _MAIN_MODULE_SEGMENT in key})
     plain: dict[str, torch.Tensor] = {}
@@ -1131,6 +1644,7 @@ def extract_start_weights(
     stage_path: str | Path,
     out_path: str | Path | None = None,
     model_args: dict[str, Any] | None = None,
+    key_map_path: str | Path | None = None,
 ) -> Path:
     """Write a plain RF-DETR checkpoint from a saved PAI stage, loadable through ``pretrain_weights``.
 
@@ -1138,6 +1652,8 @@ def extract_start_weights(
         stage_path: PAI stage file, ``<system folder>/<stage>.pt``.
         out_path: Checkpoint to write. ``None`` writes ``<stage>_plain.pth`` beside the stage file.
         model_args: Stored under the checkpoint's ``args`` key, typically a ``training_config.json`` ``model_config``.
+        key_map_path: The run's :data:`KEY_MAP_NAME` file when the run restructured the detector; its inverse puts the
+            sub-block keys back on the plain ``LWDETR`` names.
 
     Returns:
         Path of the written checkpoint.
@@ -1154,6 +1670,10 @@ def extract_start_weights(
     out = Path(out_path) if out_path is not None else stage.with_name(f"{stage.stem}_plain.pth")
     state = load_file(str(stage))
     plain = extract_plain_state(state)
+    if key_map_path is not None:
+        with open(key_map_path) as handle:
+            key_map = json.load(handle)
+        plain = remap_state_dict(plain, invert_key_map(key_map))
     logger.info("Extracted %d of %d tensors from %s into %s", len(plain), len(state), stage, out)
     torch.save({"model": plain, "args": dict(model_args or {})}, out)
     return out

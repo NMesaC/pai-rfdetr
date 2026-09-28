@@ -29,8 +29,20 @@ PathLikeStr: TypeAlias = str | Path
 #: Mixed-precision autocast dtype; ``None`` disables autocast (full fp32).
 AmpDtype: TypeAlias = Literal["auto", "bf16", "fp16", "fp8"] | None
 #: Modules that receive PerforatedAI dendrites when ``TrainConfig.perforate`` is set: every ``Linear`` and ``Conv2d``
-#: (``all``) or one decoder head. The module sets live in ``rfdetr.training.perforated``.
-PerforationTargetName: TypeAlias = Literal["all", "cls_head", "bbox_head", "cls_bbox_head"]
+#: (``all``), a decoder head, or the sub-blocks of one model part (``*_blocks``, ``enc_output``, ``all_blocks``). The
+#: module sets live in ``rfdetr.training.perforated``.
+PerforationTargetName: TypeAlias = Literal[
+    "all",
+    "cls_head",
+    "bbox_head",
+    "cls_bbox_head",
+    "backbone_blocks",
+    "decoder_blocks",
+    "enc_output",
+    "projector_blocks",
+    "segmentation_blocks",
+    "all_blocks",
+]
 #: Nonlinearity PerforatedAI applies to dendrite outputs: a name on ``torch`` or ``torch.nn.functional`` (``"relu"``,
 #: ``"gelu"``, ...), ``"identity"``, or a callable; ``None`` keeps the library default (sigmoid).
 PerforationForwardFunction: TypeAlias = str | Callable[[torch.Tensor], torch.Tensor] | None
@@ -1357,7 +1369,9 @@ class TrainConfig(BaseConfig):
     # schedule through PAI, and lets PAI switch between neuron and dendrite phases on the validation metric. See
     # ``rfdetr.training.perforated`` and docs/learn/train/perforated.md.
     perforate: bool = False
-    pai_target: PerforationTargetName = "all"
+    # A target name, or a list of module ids (``named_modules`` names with a leading dot) that receive dendrites. An id
+    # list may name sub-blocks, so it restructures the detector first like the ``*_blocks`` targets do.
+    pai_target: PerforationTargetName | list[str] = "all"
     # Validations without improvement before PAI switches phase (neuron -> dendrite, dendrite -> neuron).
     pai_n_epochs_to_switch: int = Field(default=30, ge=1)
     pai_p_epochs_to_switch: int = Field(default=4, ge=1)
@@ -1658,6 +1672,12 @@ class TrainConfig(BaseConfig):
             raise ValueError(
                 "pai_load_folder requires perforate=True: PAI modules must exist before a saved system loads."
             )
+        if not isinstance(self.pai_target, str):
+            bad = [module_id for module_id in self.pai_target if not module_id.startswith(".")]
+            if not self.pai_target or bad:
+                raise ValueError(
+                    f"pai_target ids must start with '.', like '.class_embed'; got {bad or self.pai_target}."
+                )
         if not self.perforate:
             return self
         if self.eval_interval != 1:
