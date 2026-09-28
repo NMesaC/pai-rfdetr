@@ -420,8 +420,8 @@ class RFDETRModelModule(LightningModule):
         if model_config.backbone_lora:
             apply_lora(self.model)
 
-        # PerforatedAI wraps the target modules after the pretrained weights load and before the EMA, optimizer, and
-        # checkpoint callbacks bind to the model.
+        # PerforatedAI wraps the target modules after the pretrained weights load
+        # The wrapping occurs before any other callbacks bind to the model
         if train_config.perforate:
             if model_config.compile:
                 raise ValueError(
@@ -431,7 +431,6 @@ class RFDETRModelModule(LightningModule):
                 raise ValueError(
                     "perforate=True does not support the keypoint manual-optimization path; use a detection model."
                 )
-            # Optional-dependency boundary: rfdetr.training.perforated imports perforatedai lazily.
             from rfdetr.training.perforated import perforate_detection_model
 
             self.model = perforate_detection_model(self.model, model_config, train_config)  # type: ignore[assignment]
@@ -1435,8 +1434,9 @@ class RFDETRModelModule(LightningModule):
         """
         tc = self.train_config
         if tc.perforate:
-            # PAI builds AdamW and its own ReduceLROnPlateau and rebuilds both after every restructure; Lightning is
-            # handed no scheduler so a validation is never counted twice.
+            # PAI instantiates + owns the user selected optimzier + scheduler
+            # PAI rebuilds the optimizer + scheduler after restructures
+            # Lightning is given no scheduelr so validation is not counted twice
             from rfdetr.training.perforated import setup_perforated_optimizer
 
             return cast(OptimizerLRSchedulerConfig, {"optimizer": setup_perforated_optimizer(self)})
