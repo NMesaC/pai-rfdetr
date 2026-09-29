@@ -78,34 +78,10 @@ _AUGMENTATION_BACKEND_PROBE_MODULES: Dict[str, str] = {
 
 
 # --- PerforatedAI ---
-#: Presets for ``TrainConfig.pai_target``
-#: Each name is a ready-made set of modules that receive PerforatedAI dendrites when ``TrainConfig.perforate`` is set. 
-#: ``*_head`` = Wrap the detection heads
-#: ``*_blocks`` & ``enc_output`` = Rebuild the detector into sub-blocks and wrap every block of the region
-#:
-#: Advanced users are recommended to pick their own modules instead
-#: ``pai_target`` also takes a list of module ids (``named_modules`` names with a leading dot) or fnmatch patterns
-#: This allows for granularity from a whole block down to one ``Linear`` layer
-#: The id reference table is in docs/learn/train/perforated.md, and
-#: ``rfdetr.training.perforated.list_perforable_modules(restructure_detection_model(model).model)`` 
-#: prints every id with its type for the model at hand.
-PerforationTargetName: TypeAlias = Literal[
-    "cls_head",
-    "bbox_head",
-    "cls_bbox_head",
-    "backbone_blocks",
-    "decoder_blocks",
-    "enc_output",
-    "projector_blocks",
-    "segmentation_blocks",
-    "all_blocks",
-]
-
 #: PerforatedAI Forward Function for dendrite outputs
-#: Name on ``torch`` or ``torch.nn.functional`` (``"relu"``,``"gelu"``, ...), ``"identity"``, or a callable. 
+#: Name on ``torch`` or ``torch.nn.functional`` (``"relu"``,``"gelu"``, ...), ``"identity"``, or a callable
 #:``None`` keeps the library default (sigmoid)
 PerforationForwardFunction: TypeAlias = str | Callable[[torch.Tensor], torch.Tensor] | None
-
 
 
 @functools.lru_cache(maxsize=None)
@@ -1402,22 +1378,13 @@ class TrainConfig(BaseConfig):
 
     # PerforatedAI TrainConfig Parameters
     perforate: bool = False
-    # A preset name (see ``PerforationTargetName``), or a list of module ids or fnmatch patterns
-    pai_target: PerforationTargetName | list[str] = "bbox_head"
-    # Validations without improvement before PAI switches phase (neuron -> dendrite, dendrite -> neuron)
-    pai_n_epochs_to_switch: int = Field(default=30, ge=1)
-    pai_p_epochs_to_switch: int = Field(default=4, ge=1)
-    # Batches of correlation warmup before dendrite weights change
-    # 0 resolves at train start to ```pai_initial_correlation_fraction``` of one epoch
-    pai_initial_correlation_batches: int = Field(default=0, ge=0)
-    pai_initial_correlation_fraction: float = Field(default=0.8, gt=0.0, lt=1.0)
-    # Max number of dendrites + attempts
-    pai_max_dendrites: int = Field(default=2, ge=1)
-    pai_max_dendrite_tries: int = Field(default=2, ge=1)
-    # Epochs between forced phase switches
-    # ``None`` keeps PAI's adaptive switching
-    pai_fixed_switch_every: int | None = Field(default=None, ge=1)
-    pai_testing_dendrite_capacity: bool = False
+    # Module ids (``named_modules`` names with a leading dot) or fnmatch patterns that receive dendrites
+    pai_target: list[str] = Field(default_factory=lambda: [".bbox_embed"])
+    # JSON file of ``PAIConfig`` settings
+    # Reads a flat object keyed by the library's own setting names
+    # Only the keys to change need to be present.
+    # ``None`` keeps the library defaults except ``testing_dendrite_capacity``
+    pai_config: PathLikeStr | None = None
     # Wrap every non-perforated leaf module as a PAI tracked module
     pai_track_leaves: bool = True
     # PAI system folder name written in the working directory
@@ -1425,40 +1392,11 @@ class TrainConfig(BaseConfig):
     pai_save_name: str | None = None
     pai_load_folder: PathLikeStr | None = None
     pai_load_stage: str = "latest"
-    # Switch to dendrite training at the first validation
-    # First neuron epoch runs at lr 0
-    pai_force_first_switch: bool = False
+    # Learning rate of the dendrite parameters in dendrite phases
+    # ``None`` inherits the param group's rate
     pai_dendrite_lr: float | None = Field(default=None, gt=0.0)
-    # Dendrite weights start as (main-module init) * this multiplier
-    pai_candidate_init_mult: float = Field(default=0.01, gt=0.0)
-    # Initialize dendrite weights from the main module's weights instead of a fresh init
-    pai_candidate_init_by_main: bool = False
-    # Candidate dendrites trained in parallel per switch; the best one is kept
-    pai_global_candidates: int = Field(default=1, ge=1)
+    # Dendrite output nonlinearity
     pai_forward_function: PerforationForwardFunction = None
-    # Library knobs forwarded one-to-one to a ``PAIConfig`` setter (``rfdetr.training.perforated.pai_setting_setters``)
-    # Relative improvement a validation needs to count as a new best, per dendrite count
-    pai_improvement_threshold: list[float] = Field(default_factory=lambda: [0.001, 0.0001, 0.0])
-    # Absolute improvement a validation needs to count as a new best
-    pai_improvement_threshold_raw: float = Field(default=1e-5, ge=0.0)
-    # Validations averaged before the score is compared to the best
-    pai_history_lookback: int = Field(default=1, ge=1)
-    # Validations run after a dendrite is added before PAI may add another
-    pai_initial_history_after_switches: int = Field(default=0, ge=0)
-    # Forget the best score when the phase switches, so the new phase is not held to the old best
-    pai_reset_best_score_on_switch: bool = False
-    # Sweep the previously used learning rates when a dendrite is added
-    pai_find_best_lr: bool = True
-    # Only give up on a dendrite after the learning rate was lowered at least once
-    pai_dont_give_up_unless_lr_lowered: bool = True
-    # Keep every dendrite set, including the ones that did not improve the score
-    pai_retain_all_dendrites: bool = False
-    # PAI console output
-    pai_verbose: bool = False
-    # Write PAI's score graphs
-    pai_drawing_pai: bool = True
-    # Keep the intermediate test models, which costs memory
-    pai_test_saves: bool = True
 
     @field_validator("batch_size", mode="after")
     @classmethod
@@ -1707,13 +1645,41 @@ class TrainConfig(BaseConfig):
         if self.eval_interval != 1:
             raise ValueError(
                 f"perforate=True requires eval_interval=1 (got {self.eval_interval}): PAI counts "
-                "pai_n_epochs_to_switch in validations."
+                "n_epochs_to_switch in validations."
             )
         if self.early_stopping:
             raise ValueError("perforate=True is incompatible with early_stopping=True: PAI decides when training ends.")
+        if _is_managed_scheduler_name(self.lr_scheduler):
+            raise ValueError(
+                f"perforate=True cannot use the {self.lr_scheduler!r} preset: PAI steps the scheduler once per "
+                "validation with the score. Set lr_scheduler to a class path such as "
+                "torch.optim.lr_scheduler.ReduceLROnPlateau and its arguments in lr_scheduler_kwargs."
+            )
+        for field in ("optimizer", "lr_scheduler"):
+            value = getattr(self, field)
+            if not isinstance(value, (str, type)):
+                raise ValueError(
+                    f"perforate=True needs {field} as a name or dotted class path: PAI rebuilds it from a class and "
+                    f"kwargs after every restructure, so {value!r} cannot be used."
+                )
+        spec = self.pai_forward_function
+        if isinstance(spec, str) and spec != "identity":
+            if not callable(getattr(torch, spec, None) or getattr(torch.nn.functional, spec, None)):
+                raise ValueError(
+                    f"Unknown pai_forward_function {spec!r}; pass 'identity', a torch or torch.nn.functional name, "
+                    "or a callable."
+                )
+        if self.pai_config is not None and not Path(self.pai_config).is_file():
+            raise ValueError(f"pai_config must point at a PAIConfig JSON file: {self.pai_config!s} does not exist.")
+        bad_ids = [i for i in self.pai_target if not i.startswith(".")]
+        if not self.pai_target or bad_ids:
+            raise ValueError(
+                f"pai_target ids must start with '.', like '.class_embed'; got {bad_ids or self.pai_target}."
+            )
         if self.num_nodes != 1 or self.devices not in (1, "1", "auto") or self.strategy != "auto":
             raise ValueError(
-                "perforate=True supports a single device only (num_nodes=1, devices=1 or 'auto', strategy='auto'): "
+                "Current perforated integration supports a single device only (num_nodes=1, devices=1 or 'auto', "
+                "strategy='auto'): "
                 f"got num_nodes={self.num_nodes}, devices={self.devices!r}, strategy={self.strategy!r}."
             )
         return self
@@ -1793,7 +1759,6 @@ class TrainConfig(BaseConfig):
 
     # pai_load_folder only needs Path -> str, not path resolution, so it reuses resume's validator
     @field_validator("resume", "pai_load_folder", mode="before")
-
     @classmethod
     def _coerce_resume_path(cls, v: PathLikeStr | None) -> str | None:
         """Normalise the resume checkpoint value to ``str`` without resolving it.

@@ -1,18 +1,18 @@
 ---
-description: Train RF-DETR with PerforatedAI dendrites. Set perforate=True to wrap the decoder heads, let PAI switch between neuron and dendrite phases, and read the outputs.
+description: Train RF-DETR with PerforatedAI dendrites. Set perforate=True, name the modules that get dendrites, and point pai_config at a PAIConfig JSON.
 ---
 
 # PerforatedAI Dendrites
 
-RF-DETR can train with [PerforatedAI](https://www.perforatedai.com/) artificial dendrites. Set `perforate=True` on `TrainConfig` and the training loop wraps every `Linear` and `Conv2d` of the detector in PAI neuron modules, builds the optimizer and the learning-rate schedule through PAI, and lets PAI switch between neuron training and dendrite training on the validation metric. Everything else (data pipeline, EMA, COCO evaluation, checkpoints, loggers) is the standard RF-DETR stack.
+RF-DETR can train with [PerforatedAI](https://www.perforatedai.com/) artificial dendrites. Set `perforate=True` on `TrainConfig` and name the modules that should get dendrites. PAI trains the network, adds a dendrite set when the validation score stalls, trains that, and repeats until it decides to stop. Data loading, EMA, COCO evaluation, checkpoints, and loggers are all the same from RF-DETR.
 
 ## Install
 
 ```bash
-pip install "rfdetr[train,pai]"
+pip install "rfdetr[train]" perforatedai perforatedbp
 ```
 
-`perforatedbp` needs a license supplied through environment variables. Without it the first `perforate=True` run stops at PAI's license prompt.
+`perforatedbp` needs a license, supplied through environment variables.
 
 ## Run
 
@@ -24,13 +24,16 @@ pip install "rfdetr[train,pai]"
     model = RFDETRSmall()
     model.train(
         dataset_dir="<DATASET_PATH>",
-        epochs=2000,  # Upper Bound (PAI ends the run on training_complete)
+        epochs=2000,  # An upper bound, PAI ends the run itself
         batch_size=16,
-        amp_dtype=None,  # fp32
+        amp_dtype=None,
         early_stopping=False,
         eval_interval=1,
+        lr_scheduler="torch.optim.lr_scheduler.ReduceLROnPlateau",
+        lr_scheduler_kwargs={"mode": "max", "factor": 0.1, "patience": 14, "threshold": 0.001, "min_lr": 1e-6},
         perforate=True,
-        pai_n_epochs_to_switch=30,
+        pai_target=[".bbox_embed"],
+        pai_config="configs/pai/rfdetr_nano_pills.json",
     )
     ```
 
@@ -40,78 +43,91 @@ pip install "rfdetr[train,pai]"
     rfdetr fit --config configs/rfdetr_nano_pills_pai.yaml
     ```
 
-    `configs/rfdetr_nano_pills_pai.yaml` is a complete example.
+    `configs/rfdetr_nano_pills_pai.yaml` is a full example.
 
-The plain finetune to compare against is the same call with `perforate=False`.
+The baseline run is the same command with `perforate=False`.
+
+A few settings are fixed by how PAI works.
+
+- `eval_interval` = 1 (PAI counts epochs in validations).
+- `early_stopping` must be off (PAI decides when the run ends).
+- Training runs on one device, without `compile`, and not on a keypoint model.
+- `lr_scheduler` must be a scheduler PAI can step once per validation with the score, given as a class path with its arguments in `lr_scheduler_kwargs`. The `step` and `cosine` presets are rejected.
+- `optimizer` and `lr_scheduler` must be names, not callables (PAI rebuilds both after every restructure).
 
 ## Settings
 
-| `TrainConfig` field                  | Default             | Meaning                                                                                                              |
-| ------------------------------------ | ------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `perforate`                          | `False`             | Master switch.                                                                                                       |
-| `pai_target`                         | `"all"`             | Modules that receive dendrites: `all` (every `Linear` and `Conv2d`), a head (`cls_head`, `bbox_head`, `cls_bbox_head`), a block set (`backbone_blocks`, `decoder_blocks`, `enc_output`, `projector_blocks`, `segmentation_blocks`, `all_blocks`), or a list of module ids. See Blocks. |
-| `pai_n_epochs_to_switch`             | `30`                | Validations without improvement before PAI switches phase.                                                           |
-| `pai_p_epochs_to_switch`             | `4`                 | Validations without a correlation improvement before PAI ends a dendrite phase.                                      |
-| `pai_initial_correlation_batches`    | `0`                 | Correlation warmup batches before dendrite weights move. `0` resolves at train start to the fraction below.          |
-| `pai_initial_correlation_fraction`   | `0.8`               | Fraction of one epoch used as the warmup when `pai_initial_correlation_batches` is `0`.                              |
-| `pai_max_dendrites`                  | `2`                 | Hard cap on dendrite sets.                                                                                           |
-| `pai_max_dendrite_tries`             | `2`                 | Failed cycles allowed before PAI ends the run.                                                                       |
-| `pai_fixed_switch_every`             | `None`              | Switch phase every N epochs regardless of score. `None` keeps PAI's adaptive mode.                                   |
-| `pai_testing_dendrite_capacity`      | `False`             | Run PAI's capacity probe instead of a real experiment (smoke tests).                                                 |
-| `pai_track_leaves`                   | `False`             | Wrap every non-perforated leaf module as a PAI tracked module. Fallback for a `perforatedbp` `parameter_type` halt.  |
-| `pai_save_name`                      | `None`              | PAI system folder name. `None` derives `<model>_<target>_dendritic_<timestamp>`.                                     |
-| `pai_load_folder` / `pai_load_stage` | `None` / `"latest"` | Resume from a saved PAI system folder (see Outputs).                                                                 |
-| `pai_force_first_switch`             | `False`             | Switch to dendrite training at the first validation; the one neuron epoch before it runs at lr 0.                    |
-| `pai_dendrite_lr`                    | `None`              | Learning rate of the dendrite parameters during dendrite phases. `None` inherits the param group's rate.             |
-| `pai_candidate_init_mult`            | `None`              | PAI `candidate_weight_initialization_multiplier`.                                                                    |
-| `pai_candidate_init_by_main`         | `None`              | PAI `candidate_weight_init_by_main`.                                                                                 |
-| `pai_global_candidates`              | `None`              | Candidates trained per dendrite. More than one enables PAI's `no_backward_workaround` and non-strict loading.        |
-| `pai_forward_function`               | `None`              | Dendrite output nonlinearity: a `torch` / `torch.nn.functional` name (`relu`, `gelu`, ...), `identity`, or a callable. |
+| `TrainConfig` field                  | Default             | Meaning                                                                                                                                                        |
+| ------------------------------------ | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `perforate`                          | `False`             | Perforation Switch.                                                                                                                                            |
+| `pai_target`                         | `[".bbox_embed"]`   | Modules that get dendrites, as a list of module ids or `fnmatch` patterns. See Module ids.                                                                     |
+| `pai_config`                         | `None`              | Path to a `PAIConfig` JSON (see below). `None` keeps PAI's defaults.                                                                                           |
+| `pai_track_leaves`                   | `True`              | Wrap every leaf module outside the target as a PAI tracked module. Use alongside `perforatedbp`.                                                               |
+| `pai_save_name`                      | `None`              | Name of the folder PAI writes its own state to. `None` derives `<model>_dendritic_<timestamp>`.                                                                |
+| `pai_load_folder` / `pai_load_stage` | `None` / `"latest"` | Resume from a folder PAI wrote earlier.                                                                                                                        |
+| `pai_dendrite_lr`                    | `None`              | Learning rate of the dendrite parameters while dendrites train. `None` inherits the rate of the parameter group they belong to.                                |
+| `pai_forward_function`               | `None`              | Nonlinearity on the dendrite output: a `torch` / `torch.nn.functional` name (`relu`, `gelu`, ...), `identity`, or a callable. `None` is PAI's default, sigmoid. |
 
-`TrainConfig` rejects `perforate=True` together with `eval_interval != 1`, `early_stopping=True`, multi-device settings, `compile=True`, or a keypoint model. It warns when `lr_scheduler` is set (PAI owns the schedule) and when `amp_dtype` is not `None` (mixed precision broke dendrite training on earlier arms).
+### The `PAIConfig` JSON
 
-## What the integration does
+Configuration settings for the PAI library lives in a JSON file instead of `TrainConfig`. The file is a flat object, one key per `PAIConfig` setting, using PAI's own names. Only put in the keys you want to change. An example recipe for the RF-VL100 Pills Dataset is at `configs/pai/rfdetr_nano_pills.json`.
 
-- **Wrapping.** `RFDETRModelModule` perforates the model after the pretrained weights load, so checkpoint keys match the plain model (block targets rename the keys of the rebuilt blocks, see Blocks). With `pai_target="all"` every `Linear` and `Conv2d` is wrapped (151 modules on Nano); one measuring forward pass gives each module its neuron axis, since the decoder heads see 4D stacked outputs while the rest of the model sees 3D tokens, and turns any candidate called more than once per forward (the 13 two-stage class-head copies) into a PAI tracked module instead, because perforated backpropagation cannot pair two calls with one error. Parameters outside the wrapped modules (norms, embeddings) are registered with PAI by name rather than as tracked modules, because a tracked wrapper renames parameters that RF-DETR's parameter grouping reads.
-- **Optimizer.** `configure_optimizers` returns an AdamW built through PAI's `setup_optimizer` from RF-DETR's usual layer-wise param groups. Dendrite parameters get weight decay 0. In dendrite phases only the perforated modules' parameters are handed to the optimizer, which is what keeps the backbone and transformer frozen. Lightning gets no scheduler: PAI steps a `ReduceLROnPlateau` (factor 0.1, patience 14, threshold 0.1% relative, floor `lr * 0.01`) inside `add_validation_score`, which is what its learning-rate search needs.
-- **Callback.** `PerforatedAICallback` runs after `COCOEvalCallback` and `BestModelCallback`. It copies the EMA weights into the live model before handing PAI the score (validation scores the EMA model, and PAI checkpoints the model it is handed), restores them when PAI does not restructure, and rebuilds the optimizer and the EMA copy when it does. The AdamW moments of the model's own parameters survive a restructure by name. Neuron phases score on the task metric `BestModelCallback` monitors; dendrite phases score on the mean best dendrite correlation.
+```json
+{
+  "testing_dendrite_capacity": false,
+  "n_epochs_to_switch": 30,
+  "p_epochs_to_switch": 4,
+  "max_dendrites": 2,
+  "max_dendrite_tries": 2,
+  "improvement_threshold": [0.001, 0.0001, 0.0],
+  "improvement_threshold_raw": 1e-05,
+  "history_lookback": 1,
+  "initial_history_after_switches": 0,
+  "reset_best_score_on_switch": false,
+  "find_best_lr": true,
+  "dont_give_up_unless_learning_rate_lowered": true,
+  "retain_all_dendrites": false,
+  "candidate_weight_initialization_multiplier": 0.01,
+  "candidate_weight_init_by_main": false,
+  "global_candidates": 1,
+  "verbose": false,
+  "drawing_pai": true,
+  "test_saves": true
+}
+```
+
+## Module ids
+
+`pai_target` names modules by their `named_modules` path with a leading dot. A pattern with `*`, `?`, or `[23]` expands to every id it matches, and an id or pattern that matches nothing is ignored. If one match lies inside another, only the outer module is wrapped.
+
+```yaml
+pai_target: [".bbox_embed"]                                          # The box head
+pai_target: [".class_embed", ".bbox_embed"]                          # Both heads
+pai_target: [".transformer.decoder.layers.[23].ffn"]                 # The FFN of decoder layers 2 and 3
+pai_target: [".transformer.decoder.layers.*.ffn", ".class_embed"]    # Every decoder FFN plus the class head
+```
+
+Before wrapping, RF-DETR is rebuilt into the shape PAI requires for best performance. Each normalization layer moves inside the block it belongs to and each residual add stays outside. That is what makes the sub-block ids below exist. `{i}` is a zero-based index.
+
+| Region          | Id                                                                             | What it is                                          |
+| --------------- | ------------------------------------------------------------------------------ | --------------------------------------------------- |
+| DINOv2 Backbone | `.backbone.0.encoder.encoder.encoder.layer.{i}.attention`                      | `norm1` + Attention + `layer_scale1`                |
+| DINOv2 Backbone | `.backbone.0.encoder.encoder.encoder.layer.{i}.mlp`                            | `norm2` + MLP + `layer_scale2`                      |
+| Projector       | `.backbone.0.projector.stages.{s}.{j}.cv1` / `.cv2`, `.m.{k}.cv1` / `.cv2`     | Conv + BatchNorm + Activation                       |
+| Decoder         | `.transformer.decoder.layers.{i}.self_attn`                                    | Self-Attention + Dropout + Norm                     |
+| Decoder         | `.transformer.decoder.layers.{i}.cross_attn`                                   | Deformable Cross-Attention + Dropout + Norm         |
+| Decoder         | `.transformer.decoder.layers.{i}.ffn`                                          | FFN + Dropout + Norm                                |
+| Decoder         | `.transformer.decoder.ref_point_head`                                          | Reference Point MLP                                 |
+| Two-Stage       | `.transformer.enc_output.{g}`                                                  | Linear + LayerNorm (One per `group_detr` group)     |
+| Heads           | `.class_embed` / `.bbox_embed`                                                 | The detection heads                                 |
+| Segmentation    | `.segmentation_head.blocks.{i}.branch`                                         | Depthwise Conv + Norm + Pointwise Conv (No Residual) |
+| Segmentation    | `.segmentation_head.query_features_block.branch`                               | Norm + MLP (No Residual)                            |
+
+The leaves inside a block keep their names, so `.transformer.decoder.layers.0.ffn.linear1` is a valid id too (though not recommended). The two-stage class and box heads (`.transformer.enc_out_class_embed.{g}`, `.transformer.enc_out_bbox_embed.{g}`) are called twice per forward, which PAI cannot pair with one error signal, so they are tracked rather than perforated. `list_perforable_modules(model)` in `rfdetr.training.perforated` prints every id for the model at hand.
 
 ## Outputs
 
-- `output_dir/` holds RF-DETR's usual `metrics.csv`, `last.ckpt`, and `checkpoint_best_*.pth`. These `.pth` files carry PAI-wrapped keys and only reload in a process that perforated the model the same way (same `perforate` and `pai_target`).
-- `output_dir/final_clean_model.pth` is the EMA detector with the PAI tracker removed. Its perforated heads are `perforatedai.clean_perforatedai` modules holding the neuron and dendrite layers as plain `torch.nn` layers, so the file carries the whole `LWDETR` under `module`: reload it with `torch.load(path, weights_only=False)["module"]` in any process with `perforatedai` installed. `model` is that module's state dict; it does not load into a plain `LWDETR`, and `RFDETR(pretrain_weights=...)` cannot read it. `RFDETR.train()` syncs the same clean copy onto the detector so `predict()` and `export()` work after training.
-- PAI writes its own system folder, `<model>_<target>_dendritic_<timestamp>`, in the working directory. Resume a dendrite run with `pai_load_folder` pointing at that folder, not with `resume=last.ckpt`.
-- A block target also writes `output_dir/pai_key_map.json`, the original state-dict key of every tensor a recipe moved. `extract_start_weights(..., key_map_path=...)` uses its inverse to write a checkpoint a plain `LWDETR` loads; `scripts/perforated_sweep.py` picks the file up from the `training_config.json` folder on its own.
-
-## Blocks
-
-PerforatedAI's conventions put every normalization layer inside the module that receives dendrites and keep skip connections out of dendrites. RF-DETR's blocks call their norms, branches, and residual adds as sibling operations in one forward, so the block targets first rebuild the detector with the recipes in `rfdetr.training.perforated.RECIPES`, applied by the generic walker in `rfdetr.training.perforated_restructure`:
-
-| Block | Rebuilt as | Dendrite |
-| ----- | ---------- | -------- |
-| DINOv2 layer (`backbone_blocks`) | `attention = layer_scale1(attention(norm1(x)))` and `mlp = layer_scale2(mlp(norm2(x)))`, residual adds and window reshapes stay in the layer | The branch alone, no skip |
-| Decoder layer (`decoder_blocks`) | `self_attn`, `cross_attn`, `ffn`, each `norm(x + dropout(body(x)))` with the residual and post-norm inside | `norm(dropout(body(x)))`: the copy drops the skip |
-| Two-stage `enc_output[i]` + `enc_output_norm[i]` (`enc_output`) | One `PAISequential([linear, norm])`, the norm slot becomes an identity | The pair |
-| Projector `ConvX` (`projector_blocks`) | Already `act(bn(conv(x)))`; the bottleneck residual adds stay outside | The unit |
-| Segmentation `DepthwiseConvBlock` / `MLPBlock` (`segmentation_blocks`) | A branch plus an outside residual add | The branch alone |
-
-Every recipe reuses the block's existing child modules, so no weights change, and `tests/training/test_perforated.py` checks the rebuilt Nano and Seg-Nano against the stock models in eval and train mode. `all_blocks` is every row above plus `class_embed` and the `MLP` heads. A list of module ids in `pai_target` names sub-blocks directly, for example `[".transformer.decoder.layers.0.ffn", ".transformer.decoder.layers.1.ffn"]`; `list_perforable_modules(restructure_detection_model(model).model)` prints the ids.
-
-PAI builds every dendrite as a deep copy of the wrapped module with all parameters re-randomized. `perforated.py` wraps that initializer so each copy is finished the way the blocks need: a post-norm block drops its skip connection (`configure_as_dendrite`), and the parameters of normalization modules and of scale-only modules (layer scale, `gamma`) are copied back from the neuron. This belongs in the library and is here until it moves.
-
-## Extending
-
-To add a named target, define a `PerforationTarget` in `rfdetr.training.perforated`, register it in `PERFORATION_TARGETS`, and add its name to `rfdetr.config.PerforationTargetName`. A target that names sub-blocks sets `restructure=True`. To make another block perforable, write a recipe (a callable from the block to its rebuilt form using the block's own children) and add it to `RECIPES`.
-
-## Sweeping dendrite settings
-
-`scripts/perforated_sweep.py` trains a grid of `pai_*` settings, every point from the same plateaued checkpoint, one subprocess per point because PAI keeps its state in process globals. It reads the same Lightning CLI YAML the arms train with and logs its own W&B stream (lift over the loaded model, mode, dendrite count, per-layer correlations) through the callback's observer.
-
-```bash
-python scripts/perforated_sweep.py configs/rfdetr_nano_pills_pai.yaml --list
-python scripts/perforated_sweep.py configs/rfdetr_nano_pills_pai.yaml --stage 1 --all \
-    --start-weights <system folder>/best_model_beforeSwitch_0.pt \
-    --training-config output/<run>/training_config.json
-```
-
-A PAI stage file passed as `--start-weights` is converted once with `extract_start_weights`, which strips the PAI wrapping and the dendrites from the saved state dict and writes `<stage>_plain.pth` beside it. `best_model_beforeSwitch_0` is the best neuron-only model PAI restored before it added the first dendrite. Each finished point writes `sweep_done.json` into its output folder and is skipped on restart.
+- `output_dir/` has the usual RF-DETR files: `metrics.csv`, `last.ckpt`, and `checkpoint_best_*.pth`. The `.pth` files carry PAI-wrapped keys and only load back into a model that was perforated the same way.
+- `output_dir/pai_config.json` is a copy of the JSON the run loaded.
+- `output_dir/final_clean_model.pth` is the trained detector with the PAI bookkeeping removed. The neuron and dendrite layers are plain `torch.nn` layers inside `perforatedai` clean modules, so reload it with `torch.load(path, weights_only=False)["module"]` in any environment that has `perforatedai` installed. After `RFDETR.train()` the same clean model is already loaded, so `predict()` and `export()` work right away.
+- PAI writes its own folder, `<model>_dendritic_<timestamp>`, in the working directory. It holds the score graphs, the saved stages, and the full effective config. Resume from it with `pai_load_folder`, not with `resume=last.ckpt`.

@@ -1,0 +1,21 @@
+{
+  "testing_dendrite_capacity": false,
+  "n_epochs_to_switch": 30,
+  "p_epochs_to_switch": 4,
+  "max_dendrites": 2,
+  "max_dendrite_tries": 2,
+  "improvement_threshold": [0.001, 0.0001, 0.0],
+  "improvement_threshold_raw": 1e-05,
+  "history_lookback": 1,
+  "initial_history_after_switches": 0,
+  "reset_best_score_on_switch": false,
+  "find_best_lr": true,
+  "dont_give_up_unless_learning_rate_lowered": true,
+  "retain_all_dendrites": false,
+  "candidate_weight_initialization_multiplier": 0.01,
+  "candidate_weight_init_by_main": false,
+  "global_candidates": 1,
+  "verbose": false,
+  "drawing_pai": true,
+  "test_saves": true
+}

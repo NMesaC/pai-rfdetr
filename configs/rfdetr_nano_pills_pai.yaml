@@ -1,8 +1,9 @@
 # RF-DETR Nano finetune on RF100-VL pills with PerforatedAI dendrites on the bbox head
 #   rfdetr fit --config configs/rfdetr_nano_pills_pai.yaml
-#   rfdetr fit --config configs/rfdetr_nano_pills_pai.yaml --model.train_config.init_args.pai_target bbox_head
-# The plain arm is the same file with perforate: false. scripts/perforated_sweep.py reads this file too. The recipe
-# values are explained in docs/learn/train/perforated.md.
+#   rfdetr fit --config configs/rfdetr_nano_pills_pai.yaml --model.train_config.init_args.pai_target '[.bbox_embed]'
+# The plain arm is the same file with perforate: false. The PAI library settings live in
+# configs/pai/rfdetr_nano_pills.json (pai_config). 
+# The recipe values are explained in docs/learn/train/perforated.md.
 #
 # Data: RF100-VL pills, dataset index 66 (needs ROBOFLOW_API_KEY):
 #   python -c "from rf100vl import get_rf100vl_dataset_by_index as g; g(66).download('/home/ec2-user/data/rf100-vl/pill')"
@@ -28,6 +29,15 @@ model:
       lr_encoder: 1.5e-4
       weight_decay: 1.0e-4
       warmup_epochs: 0.0
+      lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau
+      lr_scheduler_kwargs:
+        mode: max
+        factor: 0.1
+        patience: 14
+        threshold: 0.001
+        threshold_mode: rel
+        min_lr: 1.0e-6
+        cooldown: 0
       # ---- Scheduling ----
       amp_dtype: null
       early_stopping: false
@@ -41,50 +51,18 @@ model:
       run: rfdetr_nano_pills_bbox_head
       # ---- PerforatedAI ----
       perforate: true
-      # Preset name, or a list of module ids / fnmatch patterns with a leading dot
-      pai_target: bbox_head
-      # Validations without improvement before PAI switches phase, and the dendrite-phase counterpart.
-      pai_n_epochs_to_switch: 30
-      pai_p_epochs_to_switch: 4
-      # Bound on dendrite sets, and failed cycles allowed before PAI ends the run.
-      pai_max_dendrites: 2
-      pai_max_dendrite_tries: 2
-      # Correlation warmup batches before dendrite weights move
-      pai_initial_correlation_batches: 0
-      pai_initial_correlation_fraction: 0.8
-      # Switch phase every N epochs regardless of score
-      # null = PAI's adaptive switching
-      pai_fixed_switch_every: null
-      # Switch to dendrite training at the first validation
-      # The one neuron epoch before doesn't train
-      pai_force_first_switch: false
+      # Module ids / fnmatch patterns with a leading dot
+      # See docs/learn/train/perforated.md for the id table
+      pai_target: [.bbox_embed]
+      # PAIConfig settings in PAI's own JSON format.
+      # Keys are the library's setting names. null keeps the library defaults.
+      pai_config: configs/pai/rfdetr_nano_pills.json
       # Learning rate of the dendrite parameters in dendrite phases
       # null = Inherit the param group's rate.
       pai_dendrite_lr: null
       # Dendrite output nonlinearity
       # A torch / torch.nn.functional name, identity, or null for sigmoid
       pai_forward_function: null
-      # Scale of the random dendrite weights, and whether to scale by the neuron's weights instead
-      pai_candidate_init_mult: 0.01
-      pai_candidate_init_by_main: false
-      # Candidates trained per dendrite
-      pai_global_candidates: 1
-      # Improvement a validation needs to count as a new best
-      pai_improvement_threshold: [0.001, 0.0001, 0.0]
-      pai_improvement_threshold_raw: 1.0e-5
-      # Validations averaged before comparing to the best
-      pai_history_lookback: 1
-      pai_initial_history_after_switches: 0
-      # Forget the best score at a phase switch
-      pai_reset_best_score_on_switch: false
-      # Sweep the previously used learning rates when a dendrite is added
-      pai_find_best_lr: true
-      # Only ive up on a dendrite after the lr lowers at least once
-      pai_dont_give_up_unless_lr_lowered: true
-      # Keep every dendrite set, including the ones that did not improve the score
-      pai_retain_all_dendrites: false
-      # Run PAI's capacity probe instead of a real experiment
-      pai_testing_dendrite_capacity: false
       # Wrap every non-perforated leaf module as a PAI tracked module
       pai_track_leaves: false
       # PAI system folder name
@@ -92,7 +70,3 @@ model:
       # Resume from a folder with pai_load_folder and pai_load_stage
       pai_load_folder: null
       pai_load_stage: latest
-      # PAI console output, score graphs, and intermediate test-model saves
-      pai_verbose: false
-      pai_drawing_pai: true
-      pai_test_saves: true
